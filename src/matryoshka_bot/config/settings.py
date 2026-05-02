@@ -10,6 +10,9 @@ from dotenv import load_dotenv
 class BotSettings:
     bybit_api_key: str
     bybit_api_secret: str
+    bybit_demo_trading: bool
+    bybit_recv_window_ms: int
+    bybit_align_time_with_server: bool
     margin_mode: str
     leverage: int
     api_retry_attempts: int
@@ -23,6 +26,15 @@ class BotSettings:
     daily_stop_pct: float
     telegram_bot_token: str
     telegram_allowed_chat_ids: tuple[int, ...]
+    telegram_trade_alerts: bool
+    partial_tp_fraction: float
+    breakeven_offset_bps: float
+
+
+def _parse_env_bool(raw: str | None, *, default: bool) -> bool:
+    if raw is None or not str(raw).strip():
+        return default
+    return str(raw).strip().lower() in ("1", "true", "yes", "on")
 
 
 def _parse_chat_ids(raw: str) -> tuple[int, ...]:
@@ -42,6 +54,9 @@ def load_settings() -> BotSettings:
     return BotSettings(
         bybit_api_key=os.getenv("BYBIT_API_KEY", ""),
         bybit_api_secret=os.getenv("BYBIT_API_SECRET", ""),
+        bybit_demo_trading=_parse_env_bool(os.getenv("BYBIT_DEMO_TRADING"), default=True),
+        bybit_recv_window_ms=max(5000, int(os.getenv("BYBIT_RECV_WINDOW_MS", "20000"))),
+        bybit_align_time_with_server=_parse_env_bool(os.getenv("BYBIT_ALIGN_TIME_WITH_SERVER"), default=True),
         margin_mode=os.getenv("MARGIN_MODE", "cross").lower(),
         leverage=int(os.getenv("LEVERAGE", "10")),
         api_retry_attempts=int(os.getenv("API_RETRY_ATTEMPTS", "4")),
@@ -55,4 +70,7 @@ def load_settings() -> BotSettings:
         daily_stop_pct=float(os.getenv("DAILY_STOP_PCT", "-4.0")),
         telegram_bot_token=os.getenv("TELEGRAM_BOT_TOKEN", ""),
         telegram_allowed_chat_ids=_parse_chat_ids(os.getenv("TELEGRAM_ALLOWED_CHAT_IDS", "")),
+        telegram_trade_alerts=_parse_env_bool(os.getenv("TELEGRAM_TRADE_ALERTS"), default=True),
+        partial_tp_fraction=float(os.getenv("PARTIAL_TP_FRACTION", "0.5")),
+        breakeven_offset_bps=float(os.getenv("BREAKEVEN_OFFSET_BPS", "5")),
     )

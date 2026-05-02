@@ -1,0 +1,22 @@
+[Unit]
+Description=Matryoshka Bybit bot (Telegram + live trading engine)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=matryoshka
+Group=matryoshka
+WorkingDirectory=/opt/matryoshka-bot
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=-/opt/matryoshka-bot/.env
+ExecStart=/opt/matryoshka-bot/.venv/bin/python -m matryoshka_bot.main
+Restart=always
+RestartSec=15
+
+# Логи приложения остаются в WorkingDirectory/logs; журнал systemd — опционально:
+# StandardOutput=journal
+# StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

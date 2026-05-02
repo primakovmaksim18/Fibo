@@ -3,13 +3,24 @@
 __MACOSX/
 .venv/
 .env
+.env.*
+!.env.example
 
 # Python
 __pycache__/
 *.py[cod]
 *.egg-info/
+dist/
+build/
+.eggs/
 .pytest_cache/
 
-# Runtime / local (optional clones may uncomment)
-# logs/
-# state/
+# Секреты и локальный runtime (не в GitHub)
+logs/
+state/
+artifacts/
+
+# IDE / OS
+.idea/
+.vscode/
+Thumbs.db

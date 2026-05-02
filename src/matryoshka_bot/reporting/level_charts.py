@@ -7,6 +7,10 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
+import matplotlib
+
+matplotlib.use("Agg")
+
 import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle
 
@@ -209,12 +213,125 @@ def render_symbol_timeframe_chart(
     first_ts = _timestamp_to_text(candles[0]["timestamp"])
     last_ts = _timestamp_to_text(candles[-1]["timestamp"])
     ax.set_title(
-        f"{symbol} | {tf_label} | trend(F1)={trend} | F1={len(visible_fib1)} F2={len(visible_fib2)} F3={len(visible_fib3)}\n"
-        f"Range: {first_ts} -> {last_ts}"
+        f"{symbol} | TF={tf_label} | trend(F1)={trend} | F1={len(visible_fib1)} F2={len(visible_fib2)} F3={len(visible_fib3)}\n"
+        f"{first_ts} → {last_ts}\n"
+        "Легенда: F1 красный (подписи %), F2 синий, F3 зелёный; bold — ближайшие F2/F3 к last close."
     )
     ax.set_xlim(-1, len(candles))
     ax.set_ylim(y_min, y_max)
     ax.set_xlabel("Candle index")
+    ax.set_ylabel("Price")
+    ax.grid(alpha=0.2, linestyle="--")
+    fig.tight_layout()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, format="jpeg")
+    plt.close(fig)
+
+
+def render_open_position_chart(
+    symbol: str,
+    out_path: Path,
+    *,
+    position_side: str,
+    entry_price: float,
+    mark_price: float,
+    stop_exchange: float | None,
+    take_profit_exchange: float | None,
+    stop_bot: float | None,
+    take_profit_bot: float | None,
+    unrealised_pnl: float | None,
+    liq_price: float | None,
+    leverage: float | None,
+    interval: str = "60",
+    tf_label: str = "H1",
+    limit: int = 96,
+) -> None:
+    """Candles + matryoshka levels + entry/mark/SL/TP lines for Telegram monitoring."""
+    atl, ath = fetch_binance_ath_atl(symbol=symbol)
+    fib1, fib2, fib3 = build_level_orders(atl=atl, ath=ath)
+    candles = fetch_bybit_klines(symbol=symbol, interval=interval, limit=limit)
+
+    anchors = [entry_price, mark_price]
+    for raw in (stop_exchange, take_profit_exchange, stop_bot, take_profit_bot, liq_price):
+        if raw is not None:
+            anchors.append(float(raw))
+
+    fig, ax = plt.subplots(figsize=(16, 9), dpi=120)
+    _draw_candles(ax, candles)
+
+    lows = [c["low"] for c in candles]
+    highs = [c["high"] for c in candles]
+    min_y = min(lows + anchors)
+    max_y = max(highs + anchors)
+    pad = (max_y - min_y) * 0.08 if max_y > min_y else max(abs(min_y), abs(max_y)) * 0.02
+    y_min = min_y - pad
+    y_max = max_y + pad
+
+    visible_fib1 = [lv for lv in fib1 if y_min <= lv <= y_max]
+    visible_fib2 = [lv for lv in fib2 if y_min <= lv <= y_max]
+    visible_fib3 = [lv for lv in fib3 if y_min <= lv <= y_max]
+
+    for lv in visible_fib3:
+        ax.axhline(y=lv, color="#2ca02c", linewidth=0.45, alpha=0.45, zorder=1)
+    for lv in visible_fib2:
+        ax.axhline(y=lv, color="#1f77b4", linewidth=0.75, alpha=0.65, zorder=2)
+    for lv in visible_fib1:
+        ax.axhline(y=lv, color="#d62728", linewidth=1.0, alpha=0.85, zorder=4)
+
+    latest_close = candles[-1]["close"]
+    nearest_fib2 = min(fib2, key=lambda lv: abs(lv - latest_close))
+    nearest_fib3 = min(fib3, key=lambda lv: abs(lv - latest_close))
+    if y_min <= nearest_fib2 <= y_max:
+        ax.axhline(y=nearest_fib2, color="#1f77b4", linewidth=1.4, alpha=1.0, zorder=5)
+    if y_min <= nearest_fib3 <= y_max:
+        ax.axhline(y=nearest_fib3, color="#2ca02c", linewidth=1.4, alpha=1.0, zorder=5)
+
+    def _hline(y: float, color: str, style: str, label: str, lw: float = 2.0) -> None:
+        ax.axhline(y=y, color=color, linestyle=style, linewidth=lw, alpha=0.95, zorder=8)
+        ax.text(
+            len(candles) - 0.35,
+            y,
+            label,
+            color=color,
+            fontsize=8,
+            va="center",
+            ha="left",
+            zorder=9,
+            bbox={"facecolor": "white", "alpha": 0.7, "edgecolor": "none", "pad": 1.0},
+        )
+
+    _hline(entry_price, "#ff7f0e", "-", f"Entry {entry_price:.4f}", lw=2.2)
+    _hline(mark_price, "#9467bd", ":", f"Mark {mark_price:.4f}", lw=1.8)
+
+    if stop_exchange is not None and y_min <= stop_exchange <= y_max:
+        _hline(stop_exchange, "#e63946", "--", f"SL (биржа) {stop_exchange:.4f}", lw=1.8)
+    if take_profit_exchange is not None and y_min <= take_profit_exchange <= y_max:
+        _hline(take_profit_exchange, "#2ca02c", "--", f"TP (биржа) {take_profit_exchange:.4f}", lw=1.8)
+
+    if stop_bot is not None and stop_bot != stop_exchange and y_min <= stop_bot <= y_max:
+        _hline(stop_bot, "#c0392b", "-.", f"SL (бот state) {stop_bot:.4f}", lw=1.4)
+    if (
+        take_profit_bot is not None
+        and take_profit_bot != take_profit_exchange
+        and y_min <= take_profit_bot <= y_max
+    ):
+        _hline(take_profit_bot, "#27ae60", "-.", f"TP (бот state) {take_profit_bot:.4f}", lw=1.4)
+
+    if liq_price is not None and y_min <= liq_price <= y_max:
+        _hline(liq_price, "#7f7f7f", ":", f"Liq {liq_price:.4f}", lw=1.2)
+
+    lev_txt = f"{leverage:g}x" if leverage is not None else "?"
+    pnl_txt = f"{unrealised_pnl:+.4f}" if unrealised_pnl is not None else "?"
+    first_ts = _timestamp_to_text(candles[0]["timestamp"])
+    last_ts = _timestamp_to_text(candles[-1]["timestamp"])
+    ax.set_title(
+        f"{symbol} | {position_side} | TF={tf_label} | lev≈{lev_txt} | uPnL≈{pnl_txt} USDT\n"
+        f"{first_ts} → {last_ts}\n"
+        "Оранжевый — entry, фиолетовый — mark; SL/TP сплошные/пунктир — биржа vs бот; серый — ликвидация."
+    )
+    ax.set_xlim(-1, len(candles))
+    ax.set_ylim(y_min, y_max)
+    ax.set_xlabel("Bar index")
     ax.set_ylabel("Price")
     ax.grid(alpha=0.2, linestyle="--")
     fig.tight_layout()

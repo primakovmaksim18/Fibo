@@ -8,6 +8,7 @@ from typing import Any, Callable
 from pybit.unified_trading import HTTP
 
 from matryoshka_bot.config.settings import BotSettings
+from matryoshka_bot.exchange.bybit_clock import ensure_pybit_timestamp_aligned
 
 
 @dataclass(frozen=True)
@@ -52,8 +53,11 @@ class BybitClient:
         self._session = HTTP(
             api_key=api_key,
             api_secret=api_secret,
-            testnet=False,
+            demo=settings.bybit_demo_trading,
+            recv_window=int(settings.bybit_recv_window_ms),
         )
+        if api_key and api_secret and settings.bybit_align_time_with_server:
+            ensure_pybit_timestamp_aligned(self._session.endpoint)
         self._market_category = "linear"
         self._constraints_cache: dict[str, InstrumentConstraints] = {}
         self._retry_attempts = max(1, settings.api_retry_attempts)
@@ -146,6 +150,25 @@ class BybitClient:
         rows.sort(key=lambda x: x["timestamp"])
         return rows
 
+    def get_open_linear_positions(self) -> list[dict]:
+        """USDT linear perpetual positions with non-zero size (demo/prod via session domain)."""
+        result = self._call_with_retry(
+            lambda: self._session.get_positions(
+                category="linear",
+                settleCoin="USDT",
+            )
+        )
+        out: list[dict] = []
+        for row in result.get("result", {}).get("list", []) or []:
+            raw_size = row.get("size", "0") or "0"
+            try:
+                size = float(raw_size)
+            except (TypeError, ValueError):
+                size = 0.0
+            if abs(size) > 0:
+                out.append(row)
+        return out
+
     def get_wallet_equity(self, coin: str = "USDT") -> float:
         result = self._call_with_retry(
             lambda: self._session.get_wallet_balance(accountType="UNIFIED", coin=coin)
@@ -155,6 +178,27 @@ class BybitClient:
             if item["coin"] == coin:
                 return float(item["equity"])
         raise ValueError(f"equity for coin {coin} not found")
+
+    def get_usdt_wallet_snapshot(self) -> tuple[float, float, float]:
+        """USDT on unified: (equity, wallet_balance, available_balance best-effort)."""
+        result = self._call_with_retry(
+            lambda: self._session.get_wallet_balance(accountType="UNIFIED", coin="USDT")
+        )
+        coins = result["result"]["list"][0]["coin"]
+        for item in coins:
+            if item["coin"] != "USDT":
+                continue
+            equity = float(item["equity"])
+            wallet = float(item.get("walletBalance", item.get("wallet_balance", 0)) or 0)
+            avail_raw = (
+                item.get("availableBalance")
+                or item.get("available_balance")
+                or item.get("transferBalance")
+                or wallet
+            )
+            available = float(avail_raw or 0)
+            return equity, wallet, available
+        raise ValueError("USDT coin row not found in wallet balance")
 
     def get_instrument_constraints(self, symbol: str) -> InstrumentConstraints:
         if symbol in self._constraints_cache:

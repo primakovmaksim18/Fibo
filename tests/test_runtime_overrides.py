@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from matryoshka_bot.config import settings as settings_module
 from matryoshka_bot.config.settings import BotSettings
 from matryoshka_bot.trading.runtime_overrides import (
     TelegramTradingState,
@@ -20,10 +21,22 @@ def test_telegram_trading_state_roundtrip(tmp_path: Path) -> None:
     assert loaded.base_risk_pct_override == 2.0
 
 
+def test_parse_env_bool() -> None:
+    assert settings_module._parse_env_bool(None, default=True) is True
+    assert settings_module._parse_env_bool("", default=False) is False
+    assert settings_module._parse_env_bool("false", default=True) is False
+    assert settings_module._parse_env_bool("0", default=True) is False
+    assert settings_module._parse_env_bool("true", default=False) is True
+    assert settings_module._parse_env_bool("1", default=False) is True
+
+
 def test_effective_base_risk_uses_override() -> None:
     settings = BotSettings(
         bybit_api_key="",
         bybit_api_secret="",
+        bybit_demo_trading=True,
+        bybit_recv_window_ms=20000,
+        bybit_align_time_with_server=False,
         margin_mode="cross",
         leverage=10,
         api_retry_attempts=4,
@@ -37,6 +50,9 @@ def test_effective_base_risk_uses_override() -> None:
         daily_stop_pct=-4.0,
         telegram_bot_token="",
         telegram_allowed_chat_ids=(),
+        telegram_trade_alerts=True,
+        partial_tp_fraction=0.5,
+        breakeven_offset_bps=5.0,
     )
     st = TelegramTradingState(base_risk_pct_override=1.5)
     assert effective_base_risk_pct(settings, st) == 1.5

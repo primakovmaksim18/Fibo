@@ -1,0 +1,7 @@
+# Консистентные переводы строк для Linux-сервера и CI
+* text=auto
+*.py text eol=lf
+*.md text eol=lf
+*.toml text eol=lf
+*.json text eol=lf
+*.ps1 text eol=crlf

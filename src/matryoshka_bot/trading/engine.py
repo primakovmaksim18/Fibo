@@ -11,10 +11,19 @@ from matryoshka_bot.exchange.bybit_client import BybitClient, normalize_order_qt
 from matryoshka_bot.journal.store import JournalStore
 from matryoshka_bot.reporting.metrics import compute_metrics
 from matryoshka_bot.risk.sizing import calculate_position_size
-from matryoshka_bot.signals.bounce import bounce_long_confirmed, bounce_short_confirmed
-from matryoshka_bot.signals.breakout import breakout_long_confirmed, breakout_short_confirmed
+from matryoshka_bot.strategy.scan_snapshot import build_levels_cycle_snapshot
 from matryoshka_bot.strategy.scanner import scan_symbol
 from matryoshka_bot.trading.decision import fib1_trend_bias, merge_higher_tf_trend
+from matryoshka_bot.trading.signal_evaluation import analyze_entry_signals
+from matryoshka_bot.telegram_bot.trade_alerts import (
+    build_h1_audit_chart,
+    extract_order_id,
+    format_order_close_html,
+    format_order_open_html,
+    format_order_skipped_html,
+    format_signal_alert_html,
+    send_trade_alert_bundle,
+)
 from matryoshka_bot.trading.runtime_overrides import (
     effective_base_risk_pct,
     load_telegram_trading_state,
@@ -30,6 +39,8 @@ class OpenPosition:
     stop: float
     take_profit: float
     setup: str
+    take_profit_2: float | None = None
+    phase: str = "open"
 
 
 class LiveTradingEngine:
@@ -42,6 +53,24 @@ class LiveTradingEngine:
         self.positions = self._load_positions()
         self._last_entry_candle_ts: dict[str, int] = {}
         self._configure_symbols()
+        self._log_startup_exchange_positions()
+
+    def _log_startup_exchange_positions(self) -> None:
+        """Снимок открытых позиций на бирже vs state после перезапуска (логи не затираются)."""
+        try:
+            rows = self.client.get_open_linear_positions()
+            self.journal.log_event(
+                {
+                    "type": "startup_exchange_positions",
+                    "count": len(rows),
+                    "exchange_symbols": [str(r.get("symbol", "")) for r in rows],
+                    "local_open_symbols": [p.symbol for p in self.positions],
+                }
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.journal.log_event(
+                {"type": "startup_exchange_positions_error", "error": str(exc)}
+            )
 
     def _run_cycle(self) -> None:
         self._check_daily_stop()
@@ -97,9 +126,38 @@ class LiveTradingEngine:
                 ath=bounds["ath"],
             )
             candles = self.client.get_recent_klines(symbol=symbol, interval="15", limit=25)
+            d1_close = self.client.get_recent_klines(symbol=symbol, interval="D", limit=1)[-1]["close"]
+            h4_close = self.client.get_recent_klines(symbol=symbol, interval="240", limit=1)[-1]["close"]
+            trend_d1 = fib1_trend_bias(price=d1_close, fib1_levels=scan.fib1_levels)
+            trend_h4 = fib1_trend_bias(price=h4_close, fib1_levels=scan.fib1_levels)
+            trend_direction = merge_higher_tf_trend(d1_bias=trend_d1, h4_bias=trend_h4)
+            current_candle_ts = int(candles[-1]["timestamp"]) if candles else 0
+
             if len(candles) < 22:
+                snap = build_levels_cycle_snapshot(
+                    symbol=symbol,
+                    atl=bounds["atl"],
+                    ath=bounds["ath"],
+                    price=price,
+                    day_high=day_high,
+                    day_low=day_low,
+                    day_close=day_close,
+                    scan=scan,
+                    d1_close=d1_close,
+                    h4_close=h4_close,
+                    trend_d1=trend_d1,
+                    trend_h4=trend_h4,
+                    trend_direction=trend_direction,
+                    candles=candles,
+                    current_candle_ts=current_candle_ts,
+                    outcome="skipped",
+                    skip_reason=f"insufficient_15m_bars_need_22_got_{len(candles)}",
+                    bybit_demo_trading=self.settings.bybit_demo_trading,
+                )
+                snap["signal_analysis"] = {"skipped": True, "reason": "insufficient_bars_before_signal_evaluation"}
+                self.journal.log_levels_snapshot(snap)
                 continue
-            current_candle_ts = int(candles[-1]["timestamp"])
+
             if self._last_entry_candle_ts.get(symbol) == current_candle_ts:
                 self.journal.log_event(
                     {
@@ -109,24 +167,100 @@ class LiveTradingEngine:
                         "candle_ts": current_candle_ts,
                     }
                 )
+                snap = build_levels_cycle_snapshot(
+                    symbol=symbol,
+                    atl=bounds["atl"],
+                    ath=bounds["ath"],
+                    price=price,
+                    day_high=day_high,
+                    day_low=day_low,
+                    day_close=day_close,
+                    scan=scan,
+                    d1_close=d1_close,
+                    h4_close=h4_close,
+                    trend_d1=trend_d1,
+                    trend_h4=trend_h4,
+                    trend_direction=trend_direction,
+                    candles=candles,
+                    current_candle_ts=current_candle_ts,
+                    outcome="skipped",
+                    skip_reason="duplicate_symbol_same_candle_guard",
+                    bybit_demo_trading=self.settings.bybit_demo_trading,
+                )
+                snap["signal_analysis"] = {"skipped": True, "reason": "duplicate_guard_entry_not_evaluated"}
+                self.journal.log_levels_snapshot(snap)
                 continue
 
-            d1_close = self.client.get_recent_klines(symbol=symbol, interval="D", limit=1)[-1]["close"]
-            h4_close = self.client.get_recent_klines(symbol=symbol, interval="240", limit=1)[-1]["close"]
-            trend_d1 = fib1_trend_bias(price=d1_close, fib1_levels=scan.fib1_levels)
-            trend_h4 = fib1_trend_bias(price=h4_close, fib1_levels=scan.fib1_levels)
-            trend_direction = merge_higher_tf_trend(d1_bias=trend_d1, h4_bias=trend_h4)
-
-            signal = self._build_signal(
-                symbol=symbol,
+            signal, diag = analyze_entry_signals(
                 scan=scan,
                 candles=candles,
                 trend_direction=trend_direction,
             )
             if signal is None:
+                snap = build_levels_cycle_snapshot(
+                    symbol=symbol,
+                    atl=bounds["atl"],
+                    ath=bounds["ath"],
+                    price=price,
+                    day_high=day_high,
+                    day_low=day_low,
+                    day_close=day_close,
+                    scan=scan,
+                    d1_close=d1_close,
+                    h4_close=h4_close,
+                    trend_d1=trend_d1,
+                    trend_h4=trend_h4,
+                    trend_direction=trend_direction,
+                    candles=candles,
+                    current_candle_ts=current_candle_ts,
+                    outcome="no_entry",
+                    skip_reason=str(diag.get("outcome", "unknown")),
+                    bybit_demo_trading=self.settings.bybit_demo_trading,
+                )
+                snap["signal_analysis"] = diag
+                self.journal.log_levels_snapshot(snap)
                 continue
 
-            setup, side, stop, take_profit, entry_level, entry_level_order, is_countertrend = signal
+            setup, side, stop, take_profit, take_profit_2, entry_level, entry_level_order, is_countertrend = signal
+            try:
+                snap_eq, snap_wb, snap_av = self.client.get_usdt_wallet_snapshot()
+            except Exception:
+                snap_eq, snap_wb, snap_av = equity, 0.0, 0.0
+            sig_chart: Path | None = None
+            sig_cap = ""
+            try:
+                sig_chart, sig_cap = build_h1_audit_chart(symbol)
+            except Exception as exc:
+                self.journal.log_event(
+                    {"type": "telegram_alert_chart_error", "symbol": symbol, "phase": "signal", "error": str(exc)}
+                )
+            send_trade_alert_bundle(
+                self.settings,
+                html=format_signal_alert_html(
+                    symbol=symbol,
+                    setup=setup,
+                    side=side,
+                    price=price,
+                    stop=stop,
+                    take_profit=take_profit,
+                    take_profit_2=take_profit_2,
+                    entry_level=entry_level,
+                    entry_level_order=entry_level_order,
+                    equity=snap_eq,
+                    wallet_balance=snap_wb,
+                    available_balance=snap_av,
+                    base_risk_pct=base_risk,
+                    trend_d1=trend_d1,
+                    trend_h4=trend_h4,
+                    trend_direction=trend_direction,
+                    is_countertrend=is_countertrend,
+                    bybit_demo=self.settings.bybit_demo_trading,
+                    diag=diag,
+                ),
+                photo_path=sig_chart,
+                photo_caption=sig_cap,
+            )
+
             qty = calculate_position_size(
                 equity=equity,
                 risk_pct=base_risk,
@@ -144,6 +278,53 @@ class LiveTradingEngine:
                         "raw_qty": qty,
                         "price": price,
                     }
+                )
+                snap_qty = build_levels_cycle_snapshot(
+                    symbol=symbol,
+                    atl=bounds["atl"],
+                    ath=bounds["ath"],
+                    price=price,
+                    day_high=day_high,
+                    day_low=day_low,
+                    day_close=day_close,
+                    scan=scan,
+                    d1_close=d1_close,
+                    h4_close=h4_close,
+                    trend_d1=trend_d1,
+                    trend_h4=trend_h4,
+                    trend_direction=trend_direction,
+                    candles=candles,
+                    current_candle_ts=current_candle_ts,
+                    outcome="order_skipped",
+                    skip_reason="qty_or_notional_constraints_not_met",
+                    bybit_demo_trading=self.settings.bybit_demo_trading,
+                )
+                snap_qty["signal_analysis"] = diag
+                snap_qty["sizing_attempt"] = {
+                    "equity_usdt_for_sizing": equity,
+                    "base_risk_pct_applied": base_risk,
+                    "raw_qty_from_risk_model": qty,
+                    "normalized_qty": None,
+                    "estimated_notional_at_price": qty * price,
+                }
+                snap_qty["instrument_constraints"] = {
+                    "qty_step": constraints.qty_step,
+                    "min_qty": constraints.min_qty,
+                    "min_notional": constraints.min_notional,
+                    "tick_size": constraints.tick_size,
+                }
+                self.journal.log_levels_snapshot(snap_qty)
+                send_trade_alert_bundle(
+                    self.settings,
+                    html=format_order_skipped_html(
+                        symbol=symbol,
+                        reason="qty_or_notional_constraints_not_met",
+                        equity=equity,
+                        raw_qty=qty,
+                        price=price,
+                        bybit_demo=self.settings.bybit_demo_trading,
+                    ),
+                    photo_path=None,
                 )
                 continue
             order_side = "Buy" if side == "long" else "Sell"
@@ -175,6 +356,8 @@ class LiveTradingEngine:
                     stop=stop,
                     take_profit=take_profit,
                     setup=setup,
+                    take_profit_2=take_profit_2,
+                    phase="open",
                 )
             )
             self.journal.log_trade(
@@ -187,178 +370,315 @@ class LiveTradingEngine:
                     "entry": price,
                     "stop": stop,
                     "take_profit": take_profit,
+                    "take_profit_2": take_profit_2,
                     "bybit_order": order,
                 }
             )
+            snap_ok = build_levels_cycle_snapshot(
+                symbol=symbol,
+                atl=bounds["atl"],
+                ath=bounds["ath"],
+                price=price,
+                day_high=day_high,
+                day_low=day_low,
+                day_close=day_close,
+                scan=scan,
+                d1_close=d1_close,
+                h4_close=h4_close,
+                trend_d1=trend_d1,
+                trend_h4=trend_h4,
+                trend_direction=trend_direction,
+                candles=candles,
+                current_candle_ts=current_candle_ts,
+                outcome="order_placed",
+                skip_reason=None,
+                bybit_demo_trading=self.settings.bybit_demo_trading,
+            )
+            snap_ok["signal_analysis"] = diag
+            snap_ok["sizing_attempt"] = {
+                "equity_usdt_for_sizing": equity,
+                "base_risk_pct_applied": base_risk,
+                "raw_qty_from_risk_model": qty,
+                "normalized_qty": safe_qty,
+                "estimated_notional_at_price": qty * price,
+            }
+            snap_ok["instrument_constraints"] = {
+                "qty_step": constraints.qty_step,
+                "min_qty": constraints.min_qty,
+                "min_notional": constraints.min_notional,
+                "tick_size": constraints.tick_size,
+            }
+            snap_ok["execution"] = {
+                "order_side": order_side,
+                "bybit_place_order_response": order,
+                "chosen_stop_take": {
+                    "stop": stop,
+                    "take_profit_1": take_profit,
+                    "take_profit_2": take_profit_2,
+                },
+                "chosen_setup_side": {"setup": setup, "side": side, "is_countertrend": is_countertrend},
+            }
+            self.journal.log_levels_snapshot(snap_ok)
+
+            try:
+                open_eq, open_wb, open_av = self.client.get_usdt_wallet_snapshot()
+            except Exception:
+                open_eq, open_wb, open_av = equity, 0.0, 0.0
+            open_chart: Path | None = None
+            open_cap = ""
+            try:
+                open_chart, open_cap = build_h1_audit_chart(symbol)
+            except Exception as exc:
+                self.journal.log_event(
+                    {"type": "telegram_alert_chart_error", "symbol": symbol, "phase": "open", "error": str(exc)}
+                )
+            send_trade_alert_bundle(
+                self.settings,
+                html=format_order_open_html(
+                    symbol=symbol,
+                    setup=setup,
+                    side=side,
+                    order_side=order_side,
+                    qty=safe_qty,
+                    entry=price,
+                    stop=stop,
+                    take_profit=take_profit,
+                    take_profit_2=take_profit_2,
+                    equity=open_eq,
+                    wallet_balance=open_wb,
+                    available_balance=open_av,
+                    base_risk_pct=base_risk,
+                    order_id=extract_order_id(order),
+                    bybit_demo=self.settings.bybit_demo_trading,
+                ),
+                photo_path=open_chart,
+                photo_caption=open_cap,
+            )
+
             placed_symbols_this_cycle.add(symbol)
             self._last_entry_candle_ts[symbol] = current_candle_ts
 
-    def _build_signal(
+    def _breakeven_stop_price(self, position: OpenPosition) -> float:
+        c = self.client.get_instrument_constraints(position.symbol)
+        bps = max(0.0, self.settings.breakeven_offset_bps)
+        pct_off = position.entry * (bps / 10000.0)
+        tick_off = 2.0 * c.tick_size
+        offset = max(pct_off, tick_off)
+        if position.side == "long":
+            return position.entry - offset
+        return position.entry + offset
+
+    def _split_qty_partial(self, total: float, price: float, symbol: str) -> tuple[float | None, float | None]:
+        c = self.client.get_instrument_constraints(symbol)
+        frac = max(0.0, min(1.0, self.settings.partial_tp_fraction))
+        if frac <= 0 or frac >= 1 or total <= 0:
+            return None, None
+        raw_first = total * frac
+        first = normalize_order_qty(raw_first, price, c)
+        if first is None or first <= 0 or first >= total:
+            return None, None
+        rest = total - first
+        rest_n = normalize_order_qty(rest, price, c)
+        if rest_n is None or rest_n <= 0:
+            return None, None
+        return first, rest_n
+
+    def _close_market_notify(
         self,
-        symbol: str,
-        scan,
-        candles: list[dict],
-        trend_direction: str,
-    ) -> tuple[str, str, float, float, float, str, bool] | None:
-        latest = candles[-1]
-        breakout_candle = candles[-2]
-        volume_sma20 = sum(c["volume"] for c in candles[-21:-1]) / 20
-        rsi = self._simple_rsi(candles[-15:])
-        prev_rsi = self._simple_rsi(candles[-16:-1])
-        entry_grid = sorted(set(scan.fib2_levels + scan.fib3_levels))
-        support, resistance = self._nearest_entry_levels(price=scan.price, levels=entry_grid)
-        if support is None or resistance is None:
-            return None
-        segment_width = max(resistance - support, 1e-12)
-        stop_buffer = 0.1 * segment_width
-        support_order = self._level_order_name(support, scan.fib2_levels, scan.fib3_levels)
-        resistance_order = self._level_order_name(resistance, scan.fib2_levels, scan.fib3_levels)
-
-        candidates: list[tuple[str, str, float, float, float, str]] = []
-
-        if bounce_long_confirmed(
-            close=latest["close"],
-            level=support,
-            low=latest["low"],
-            volume=latest["volume"],
-            volume_sma20=volume_sma20,
-            rsi=rsi,
-            prev_rsi=prev_rsi,
-        ):
-            candidates.append(("bounce", "long", support - stop_buffer, resistance, support, support_order))
-        if breakout_long_confirmed(
-            close=breakout_candle["close"],
-            open_price=breakout_candle["open"],
-            high=breakout_candle["high"],
-            low=breakout_candle["low"],
-            level=resistance,
-            volume=breakout_candle["volume"],
-            volume_sma20=volume_sma20,
-            next_close=latest["close"],
-        ):
-            candidates.append(
-                (
-                    "breakout",
-                    "long",
-                    support - stop_buffer,
-                    resistance + segment_width,
-                    resistance,
-                    resistance_order,
-                )
-            )
-        if bounce_short_confirmed(
-            close=latest["close"],
-            level=resistance,
-            high=latest["high"],
-            volume=latest["volume"],
-            volume_sma20=volume_sma20,
-            rsi=rsi,
-            prev_rsi=prev_rsi,
-        ):
-            candidates.append(("bounce", "short", resistance + stop_buffer, support, resistance, resistance_order))
-        if breakout_short_confirmed(
-            close=breakout_candle["close"],
-            open_price=breakout_candle["open"],
-            high=breakout_candle["high"],
-            low=breakout_candle["low"],
-            level=support,
-            volume=breakout_candle["volume"],
-            volume_sma20=volume_sma20,
-            next_close=latest["close"],
-        ):
-            candidates.append(
-                (
-                    "breakout",
-                    "short",
-                    resistance + stop_buffer,
-                    support - segment_width,
-                    support,
-                    support_order,
-                )
-            )
-
-        if not candidates:
-            return None
-
-        priority_side = trend_direction if trend_direction in {"long", "short"} else None
-        sorted_candidates = sorted(
-            candidates,
-            key=lambda item: (
-                0 if (priority_side is not None and item[1] == priority_side) else 1,
-                0 if item[0] == "bounce" else 1,
-            ),
+        position: OpenPosition,
+        price: float,
+        qty: float,
+        exit_reason: str,
+    ) -> None:
+        close_side = "Sell" if position.side == "long" else "Buy"
+        order = self.client.place_market_order(
+            symbol=position.symbol,
+            side=close_side,
+            qty=qty,
+            reduce_only=True,
         )
-
-        for setup, side, stop, take_profit, entry_level, entry_level_order in sorted_candidates:
-            is_countertrend = trend_direction in {"long", "short"} and side != trend_direction
-            if is_countertrend and setup != "breakout":
-                continue
-            return (setup, side, stop, take_profit, entry_level, entry_level_order, is_countertrend)
-        return None
-
-    @staticmethod
-    def _nearest_entry_levels(price: float, levels: list[float]) -> tuple[float | None, float | None]:
-        below = [level for level in levels if level <= price]
-        above = [level for level in levels if level >= price]
-        support = max(below) if below else None
-        resistance = min(above) if above else None
-        if support is None and levels:
-            support = levels[0]
-        if resistance is None and levels:
-            resistance = levels[-1]
-        return support, resistance
-
-    @staticmethod
-    def _level_order_name(level: float, fib2_levels: list[float], fib3_levels: list[float]) -> str:
-        if any(abs(level - value) <= 1e-6 for value in fib2_levels):
-            return "fib2"
-        if any(abs(level - value) <= 1e-6 for value in fib3_levels):
-            return "fib3"
-        return "unknown"
+        direction = 1 if position.side == "long" else -1
+        pnl = (price - position.entry) * qty * direction
+        self.journal.log_trade(
+            {
+                "event": "close",
+                "reason": exit_reason,
+                "symbol": position.symbol,
+                "setup": position.setup,
+                "side": position.side,
+                "qty": qty,
+                "entry": position.entry,
+                "exit": price,
+                "pnl": pnl,
+                "bybit_order": order,
+            }
+        )
+        try:
+            cls_eq, cls_wb, cls_av = self.client.get_usdt_wallet_snapshot()
+        except Exception:
+            cls_eq, cls_wb, cls_av = 0.0, 0.0, 0.0
+        cls_chart: Path | None = None
+        cls_cap = ""
+        try:
+            cls_chart, cls_cap = build_h1_audit_chart(position.symbol)
+        except Exception as exc:
+            self.journal.log_event(
+                {
+                    "type": "telegram_alert_chart_error",
+                    "symbol": position.symbol,
+                    "phase": "close",
+                    "error": str(exc),
+                }
+            )
+        send_trade_alert_bundle(
+            self.settings,
+            html=format_order_close_html(
+                symbol=position.symbol,
+                setup=position.setup,
+                side=position.side,
+                reason=exit_reason,
+                qty=qty,
+                entry=position.entry,
+                exit_price=price,
+                pnl=pnl,
+                equity=cls_eq,
+                wallet_balance=cls_wb,
+                available_balance=cls_av,
+                order_id=extract_order_id(order),
+                bybit_demo=self.settings.bybit_demo_trading,
+            ),
+            photo_path=cls_chart,
+            photo_caption=cls_cap,
+        )
 
     def _sync_exit_logic(self) -> None:
         alive: list[OpenPosition] = []
         for position in self.positions:
             price = self.client.get_last_price(position.symbol)
-            exit_reason = None
-            if position.side == "long":
-                if price <= position.stop:
-                    exit_reason = "stop_loss"
-                elif price >= position.take_profit:
-                    exit_reason = "take_profit"
-            else:
-                if price >= position.stop:
-                    exit_reason = "stop_loss"
-                elif price <= position.take_profit:
-                    exit_reason = "take_profit"
+            tp1 = position.take_profit
+            tp2 = position.take_profit_2
 
-            if exit_reason is None:
+            if tp2 is None:
+                exit_reason = None
+                if position.side == "long":
+                    if price <= position.stop:
+                        exit_reason = "stop_loss"
+                    elif price >= tp1:
+                        exit_reason = "take_profit"
+                else:
+                    if price >= position.stop:
+                        exit_reason = "stop_loss"
+                    elif price <= tp1:
+                        exit_reason = "take_profit"
+
+                if exit_reason is None:
+                    alive.append(position)
+                else:
+                    self._close_market_notify(position, price, position.qty, exit_reason)
+                continue
+
+            phase = position.phase
+            if phase == "open":
+                if position.side == "long":
+                    if price <= position.stop:
+                        self._close_market_notify(position, price, position.qty, "stop_loss")
+                        continue
+                    if price >= tp1:
+                        first, rest = self._split_qty_partial(position.qty, price, position.symbol)
+                        if first is None:
+                            self._close_market_notify(position, price, position.qty, "take_profit_1_full")
+                            continue
+                        po = self.client.place_market_order(
+                            symbol=position.symbol,
+                            side="Sell",
+                            qty=first,
+                            reduce_only=True,
+                        )
+                        pnl_p = (price - position.entry) * first
+                        self.journal.log_trade(
+                            {
+                                "event": "partial_tp",
+                                "reason": "take_profit_1",
+                                "symbol": position.symbol,
+                                "setup": position.setup,
+                                "side": position.side,
+                                "qty": first,
+                                "qty_remaining": rest,
+                                "entry": position.entry,
+                                "exit": price,
+                                "pnl": pnl_p,
+                                "bybit_order": po,
+                            }
+                        )
+                        position.qty = rest
+                        position.stop = self._breakeven_stop_price(position)
+                        position.phase = "after_partial"
+                        if price >= tp2:
+                            self._close_market_notify(position, price, position.qty, "take_profit_2")
+                            continue
+                        alive.append(position)
+                        continue
+                else:
+                    if price >= position.stop:
+                        self._close_market_notify(position, price, position.qty, "stop_loss")
+                        continue
+                    if price <= tp1:
+                        first, rest = self._split_qty_partial(position.qty, price, position.symbol)
+                        if first is None:
+                            self._close_market_notify(position, price, position.qty, "take_profit_1_full")
+                            continue
+                        po = self.client.place_market_order(
+                            symbol=position.symbol,
+                            side="Buy",
+                            qty=first,
+                            reduce_only=True,
+                        )
+                        pnl_p = (position.entry - price) * first
+                        self.journal.log_trade(
+                            {
+                                "event": "partial_tp",
+                                "reason": "take_profit_1",
+                                "symbol": position.symbol,
+                                "setup": position.setup,
+                                "side": position.side,
+                                "qty": first,
+                                "qty_remaining": rest,
+                                "entry": position.entry,
+                                "exit": price,
+                                "pnl": pnl_p,
+                                "bybit_order": po,
+                            }
+                        )
+                        position.qty = rest
+                        position.stop = self._breakeven_stop_price(position)
+                        position.phase = "after_partial"
+                        if price <= tp2:
+                            self._close_market_notify(position, price, position.qty, "take_profit_2")
+                            continue
+                        alive.append(position)
+                        continue
+
                 alive.append(position)
                 continue
 
-            close_side = "Sell" if position.side == "long" else "Buy"
-            order = self.client.place_market_order(
-                symbol=position.symbol,
-                side=close_side,
-                qty=position.qty,
-                reduce_only=True,
-            )
-            direction = 1 if position.side == "long" else -1
-            pnl = (price - position.entry) * position.qty * direction
-            self.journal.log_trade(
-                {
-                    "event": "close",
-                    "reason": exit_reason,
-                    "symbol": position.symbol,
-                    "setup": position.setup,
-                    "side": position.side,
-                    "qty": position.qty,
-                    "entry": position.entry,
-                    "exit": price,
-                    "pnl": pnl,
-                    "bybit_order": order,
-                }
-            )
+            if phase == "after_partial":
+                if position.side == "long":
+                    if price <= position.stop:
+                        self._close_market_notify(position, price, position.qty, "breakeven_or_stop")
+                        continue
+                    if price >= tp2:
+                        self._close_market_notify(position, price, position.qty, "take_profit_2")
+                        continue
+                else:
+                    if price >= position.stop:
+                        self._close_market_notify(position, price, position.qty, "breakeven_or_stop")
+                        continue
+                    if price <= tp2:
+                        self._close_market_notify(position, price, position.qty, "take_profit_2")
+                        continue
+
+            alive.append(position)
+
         self.positions = alive
 
     def _check_daily_stop(self) -> None:
@@ -409,24 +729,13 @@ class LiveTradingEngine:
         if not self.state_path.exists():
             return []
         data = json.loads(self.state_path.read_text(encoding="utf-8"))
-        return [OpenPosition(**row) for row in data]
+        rows: list[OpenPosition] = []
+        for row in data:
+            row.setdefault("take_profit_2", None)
+            row.setdefault("phase", "open")
+            rows.append(OpenPosition(**row))
+        return rows
 
     def _write_state(self) -> None:
         payload = [asdict(position) for position in self.positions]
         self.state_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-
-    @staticmethod
-    def _simple_rsi(candles: list[dict]) -> float:
-        closes = [c["close"] for c in candles]
-        gains = []
-        losses = []
-        for i in range(1, len(closes)):
-            change = closes[i] - closes[i - 1]
-            gains.append(max(change, 0.0))
-            losses.append(abs(min(change, 0.0)))
-        avg_gain = sum(gains) / max(len(gains), 1)
-        avg_loss = sum(losses) / max(len(losses), 1)
-        if avg_loss == 0:
-            return 100.0
-        rs = avg_gain / avg_loss
-        return 100.0 - (100.0 / (1.0 + rs))

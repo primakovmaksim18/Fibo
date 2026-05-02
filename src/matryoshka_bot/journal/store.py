@@ -13,6 +13,7 @@ class JournalStore:
         self.signals_path = self.base_path / "signals.jsonl"
         self.trades_path = self.base_path / "trades.jsonl"
         self.events_path = self.base_path / "events.jsonl"
+        self.levels_path = self.base_path / "levels.jsonl"
 
     def log_signal(self, payload: dict[str, Any]) -> None:
         self._append(self.signals_path, payload)
@@ -22,6 +23,9 @@ class JournalStore:
 
     def log_event(self, payload: dict[str, Any]) -> None:
         self._append(self.events_path, payload)
+
+    def log_levels_snapshot(self, payload: dict[str, Any]) -> None:
+        self._append(self.levels_path, payload)
 
     def read_trade_pnls(self) -> list[float]:
         if not self.trades_path.exists():
